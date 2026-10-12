@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: electric_cat_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  ollama-init:
+    image: curlimages/curl:latest
+    container_name: electric_cat_ollama_init
+    depends_on:
+      - ollama
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo 'Waiting for Ollama service...'
+        until curl -s http://ollama:11434/api/health > /dev/null; do
+          sleep 2
+        done
+        echo 'Pulling Gemma model...'
+        curl -X POST http://ollama:11434/api/pull -d '{"name": "gemma"}'
+        echo 'Gemma model ready!'
+
+  frontend:
+    image: node:20-alpine
+    container_name: electric_cat_frontend
+    depends_on:
+      - ollama
+    ports:
+      - "3000:3000"
+    working_dir: /app
+    volumes:
+      - ./app.jsx:/app/src/app.jsx
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cat << 'EOF' > package.json
+        {
+          "name": "electric-cat-verifier",
+          "private": true,
+          "version": "1.0.0",
+          "type": "module",
+          "scripts": {
+            "dev": "vite --host 0.0.0.0 --port 3000"
+          },
+          "dependencies": {
+            "@solidjs/router": "^0.8.4",
+            "jszip": "^3.10.1",
+            "solid-js": "^1.8.18"
+          },
+          "devDependencies": {
+            "vite": "^5.2.0",
+            "vite-plugin-solid": "^2.10.2"
+          }
+        }
+        EOF
+
+        cat << 'EOF' > vite.config.js
+        import { defineConfig } from 'vite';
+        import solidPlugin from 'vite-plugin-solid';
+
+        export default defineConfig({
+          plugins: [solidPlugin()],
+          server: {
+            port: 3000,
+            proxy: {
+              '/api/ollama': {
+                target: 'http://ollama:11434',
+                changeOrigin: true,
+                rewrite: (path) => path.replace(/^\/api\/ollama/, '')
+              }
+            }
+          }
+        });
+        EOF
+
+        mkdir -p src
+
+        cat << 'EOF' > index.html
+        <!DOCTYPE html>
+        <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Marine Assembly & Operations Manual Generator</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/pdfmake.min.js"></script>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.7/vfs_fonts.js"></script>
+          </head>
+          <body class="bg-white text-zinc-900 min-h-screen">
+            <div id="root"></div>
+            <script type="module" src="/src/app.jsx"></script>
+          </body>
+        </html>
+        EOF
+
+        npm install
+        npm run dev
+
+volumes:
+  ollama_data:
