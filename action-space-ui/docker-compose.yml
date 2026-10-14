@@ -1,0 +1,92 @@
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ollama/ollama:latest
+        RUN apt-get update && apt-get install -y curl
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        ollama serve &
+        until curl -s http://localhost:11434/api/tags > /dev/null; do sleep 1; done
+        ollama pull gemma:2b
+        wait
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile_inline: |
+        # --- BUILDER STAGE ---
+        FROM ubuntu:22.04 AS builder
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y curl openjdk-17-jdk gzip python3-pip wget
+
+        # Install Scala-CLI
+        RUN ARCH=$$(dpkg --print-architecture) && \
+            if [ "$$ARCH" = "arm64" ]; then \
+              SCALA_ARCH="aarch64-pc-linux"; \
+            else \
+              SCALA_ARCH="x86_64-pc-linux"; \
+            fi && \
+            curl -fL https://github.com/VirtusLab/scala-cli/releases/latest/download/scala-cli-$${SCALA_ARCH}.gz | gzip -d > /usr/local/bin/scala-cli && \
+            chmod +x /usr/local/bin/scala-cli
+
+        # Install Trealla Prolog
+        RUN wget -qO /usr/local/bin/tpl https://github.com/trealla-prolog/trealla/releases/latest/download/tpl-linux-x86_64 || \
+            wget -qO /usr/local/bin/tpl https://github.com/trealla-prolog/trealla/releases/download/v2.24.5/tpl-linux-x86_64 || true
+        RUN chmod +x /usr/local/bin/tpl
+
+        WORKDIR /build
+        COPY main.scala index.html ./
+        RUN scala-cli config power true
+
+        # Cache Coursier dependency downloads permanently across builds
+        RUN --mount=type=cache,target=/root/.cache/coursier \
+            scala-cli package main.scala --assembly -o /usr/local/bin/app.jar --force
+
+        # --- RUNTIME STAGE ---
+        FROM ubuntu:22.04
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y openjdk-17-jre-headless curl python3-pip && rm -rf /var/lib/apt/lists/*
+        RUN pip3 install requests ujson
+
+        # Copy compiled binary and prolog interpreter from builder stage
+        COPY --from=builder /usr/local/bin/app.jar /usr/local/bin/app.jar
+        COPY --from=builder /usr/local/bin/tpl /usr/local/bin/tpl
+
+        WORKDIR /app
+        COPY index.html ./
+    container_name: app
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    command: ["java", "-jar", "/usr/local/bin/app.jar"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 180s
+volumes:
+  ollama_data:
