@@ -1,0 +1,155 @@
+services:
+  ollama:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ollama/ollama:latest
+        RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        ollama serve &
+        until curl -s http://localhost:11434/api/tags > /dev/null; do sleep 2; done
+        ollama pull gemma:2b
+        wait
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-X", "POST", "http://localhost:11434/api/show", "-d", "{\"name\":\"gemma:2b\"}"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  app:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:22.04 AS builder
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y curl openjdk-17-jdk gzip python3-pip wget
+
+        # Install Scala-CLI & Trealla Prolog matching container architecture
+        RUN ARCH=$$(dpkg --print-architecture) && \
+            if [ "$$ARCH" = "arm64" ]; then \
+              SCALA_ARCH="aarch64-pc-linux"; \
+              TPL_ARCH="aarch64"; \
+            else \
+              SCALA_ARCH="x86_64-pc-linux"; \
+              TPL_ARCH="x86_64"; \
+            fi && \
+            curl -fL https://github.com/VirtusLab/scala-cli/releases/latest/download/scala-cli-$${SCALA_ARCH}.gz | gzip -d > /usr/local/bin/scala-cli && \
+            chmod +x /usr/local/bin/scala-cli && \
+            (wget -qO /usr/local/bin/tpl https://github.com/trealla-prolog/trealla/releases/latest/download/tpl-linux-$${TPL_ARCH} || \
+             wget -qO /usr/local/bin/tpl https://github.com/trealla-prolog/trealla/releases/download/v2.58.14/tpl-linux-$${TPL_ARCH} || true) && \
+            chmod +x /usr/local/bin/tpl
+
+        WORKDIR /build
+        COPY main.scala logic.pl ./
+        RUN scala-cli config power true
+        RUN --mount=type=cache,target=/root/.cache/coursier \
+            scala-cli package main.scala --assembly -o /usr/local/bin/app.jar --force
+
+        # --- RUNTIME STAGE ---
+        FROM ubuntu:22.04
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y openjdk-17-jre-headless curl python3-pip && rm -rf /var/lib/apt/lists/*
+        RUN pip3 install requests ujson
+
+        COPY --from=builder /usr/local/bin/app.jar /usr/local/bin/app.jar
+        COPY --from=builder /usr/local/bin/tpl /usr/local/bin/tpl
+
+        WORKDIR /app
+        COPY logic.pl ./
+    container_name: app
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    command: ["java", "-jar", "/usr/local/bin/app.jar"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 5s
+      timeout: 3s
+      retries: 36
+      start_period: 180s
+
+  frontend:
+    image: node:22-alpine
+    container_name: electric_cat_frontend
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      app:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - |
+        cat << 'EOF' > package.json
+        {
+          "name": "action-space-solid2",
+          "private": true,
+          "version": "2.0.0",
+          "type": "module",
+          "scripts": {
+            "dev": "vite --host 0.0.0.0 --port 3000"
+          },
+          "dependencies": {
+            "@solidjs/web": "^2.0.1",
+            "jszip": "^3.10.1",
+            "solid-js": "^2.0.1"
+          },
+          "devDependencies": {
+            "vite": "^6.0.0",
+            "vite-plugin-solid": "next"
+          }
+        }
+        EOF
+        cat << 'EOF' > vite.config.js
+        import { defineConfig } from "vite";
+        import solidPlugin from "vite-plugin-solid";
+
+        export default defineConfig({
+          plugins: [solidPlugin()],
+          server: {
+            port: 3000,
+            host: "0.0.0.0",
+            proxy: {
+              "/api": {
+                target: "http://app:8080",
+                changeOrigin: true,
+                configure: (proxy) => {
+                  proxy.on("proxyReq", (proxyReq) => {
+                    proxyReq.setHeader("Accept-Encoding", "identity");
+                  });
+                  proxy.on("proxyRes", (proxyRes) => {
+                    proxyRes.headers["cache-control"] = "no-cache, no-transform";
+                    proxyRes.headers["x-accel-buffering"] = "no";
+                  });
+                }
+              }
+            }
+          }
+        });
+        EOF
+        npm install
+        npm run dev
+
+volumes:
+  ollama_data:

@@ -1,0 +1,10 @@
+*
+!/*/
+!.gitignore
+!docker-compose.yml
+!index.html
+!main.scala
+!logic.pl
+!app.jsx
+!data/
+!data/catamaran.js
